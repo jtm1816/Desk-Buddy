@@ -1,0 +1,15 @@
+# Private local configuration and generated build files
+secrets.h
+.env
+.env.*
+!.env.example
+work/
+build/
+*.elf
+*.map
+*.o
+*.log
+*nvs*.bin
+*backup*.bin
+.DS_Store
+Thumbs.db
