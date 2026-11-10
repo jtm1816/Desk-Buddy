@@ -1,19 +1,19 @@
-# Public firmware build
+# Two-hour/background radar build
 
-Built November 5, 2026 with Arduino-ESP32 3.3.12.
+Built November 10, 2026 with Arduino-ESP32 3.3.12.
 
 - Target: `esp32:esp32:jczn_2432s028r:PartitionScheme=huge_app`
-- Program storage: 1,364,971 / 3,145,728 bytes (43%)
-- Static RAM: 57,764 / 327,680 bytes (17%)
-- Display: ST7789 240x320 BGR, 40 MHz SPI
-- `PNG_SPLIT_DICTIONARY` enabled; bundled patched PNGdec 1.1.6
-- Public build has empty Wi-Fi defaults. Source and binary were checked against private network strings without recording those values.
-- Map generator verified to reproduce both included map headers byte-for-byte from the supplied cropped OSM extract.
+- Program storage: 1,367,027 / 3,145,728 bytes (43%)
+- Static RAM: 60,228 / 327,680 bytes (18%)
+- ST7789 240x320 BGR, XPT2046 touch, 3 MB application layout
+- Up to 13 ten-minute frames spanning the latest available two-hour window
+- Background metadata refresh every 30 seconds after a completed attempt, while Wi-Fi and clock are ready
+- Cached frames are reused; obsolete history is pruned and only missing timestamps are downloaded
+- Opening Weather Radar selects the newest cached frame without forcing a download
+- RainViewer's live feed returned 13 frames spanning 120 minutes during the check
+- Cached crops use lossless run-length compression when smaller; raw fallback keeps every pixel unchanged. One 2,304-byte display buffer is reused. Each compressed insertion is verified against the original decoded crop.
+- Maximum uncompressed history is 29,952 bytes; actual stored bytes are reported by the diagnostic endpoint.
 
-## Download
+[Application firmware](firmware/deskbuddy-radar-st7789-app.bin) belongs at **0x10000** on the existing matching 3 MB layout. It is not a fresh-board image; see [SETUP.md](SETUP.md) for source upload instructions. Empty Wi-Fi defaults; no NVS/device dump is included.
 
-[Application firmware](firmware/deskbuddy-radar-st7789-app.bin) ([SHA-256](SHA256SUMS)).
-
-This is an **application-only** image for **0x10000**, for a board that already has the matching Huge App partition layout. For a fresh board, use the source/Arduino upload instructions in [SETUP.md](SETUP.md). This image is not a full-flash dump and contains no saved NVS data.
-
-The public build compiles successfully. It has not been flashed separately to a clean board; the user's installed build, with the same application behavior and private Wi-Fi defaults, was verified on the physical device. No device was reflashed during GitHub preparation.
+Compilation, source/binary privacy checks, firmware upload hash verification, and live 13-frame background/playback checks passed. See [VERIFICATION.md](VERIFICATION.md).

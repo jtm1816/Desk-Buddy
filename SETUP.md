@@ -47,4 +47,4 @@ The application-only binary belongs at **0x10000** and assumes that the correct 
 
 The radar center, map, and imagery are fixed together at Thomson, GA, latitude 33.4706, longitude -82.5009. Both maps show a 15-mile radius. Moving only the normal weather location would misalign the map and radar, so this firmware deliberately keeps their center fixed. A different radar location needs regenerated map assets and matching source constants.
 
-The weather view requests the seven newest past frames and caches decoded crops. It retries missing data, retains good cached frames on network failures, and refreshes while visible. The forecast clock, frame time, and animation time are different concepts; the displayed radar time is the image's timestamp.
+The weather view requests up to thirteen past frames spanning the provider's latest two hours and caches decoded crops. It retries missing data, retains good cached frames within the current history window on network failures, and refreshes in the background even when another page is open. The forecast clock, frame time, and animation time are different concepts; the displayed radar time is the image's timestamp.

@@ -19,12 +19,16 @@ static const uint16_t WR_COLORS[] = {
 };
 static SemaphoreHandle_t wrMutex = nullptr;
 static TaskHandle_t wrTask = nullptr;
-static constexpr uint8_t WR_HISTORY = 7;
-struct WrCachedFrame { time_t stamp; uint8_t *pixels; };
+static constexpr uint8_t WR_HISTORY = 13; // Inclusive endpoints: 120 minutes at 10-minute intervals.
+static constexpr time_t WR_HISTORY_SECONDS = 2 * 60 * 60;
+struct WrCachedFrame { time_t stamp; uint8_t *pixels; uint16_t storedBytes; bool packed; };
+static uint8_t wrDisplayPixels[WR_CROP_SIZE * WR_CROP_SIZE];
+static uint32_t wrLosslessChecks = 0, wrCodecFailures = 0;
 struct WrRemoteFrame { time_t stamp; String path; };
 static WrCachedFrame wrFrames[WR_HISTORY] = {};
 static uint8_t wrFrameCount = 0, wrFrameIndex = 0, wrLastLoadedFrames = 0;
 static time_t wrLastHistory[WR_HISTORY] = {};
+static uint8_t wrLastRequestedCount = 0;
 static uint32_t wrLastAnimationMs = 0, wrAnimationSteps = 0;
 static uint8_t *wrOverlay = nullptr; // Non-owning alias of the displayed cached crop.
 static void updateWeatherRadarDynamic(bool force);
@@ -144,6 +148,9 @@ static bool wrFetchFrames(WrRemoteFrame *frames, uint8_t &count, char *error, si
   if (past.size() == 0 || doc["host"].as<String>() != "https://tilecache.rainviewer.com") {
     snprintf(error, errorSize, "No radar frames available"); return false;
   }
+  time_t newest = past[past.size() - 1]["time"].as<time_t>();
+  if (newest < 1700000000) { snprintf(error, errorSize, "Radar history invalid"); return false; }
+  time_t cutoff = newest - WR_HISTORY_SECONDS;
   size_t start = past.size() > WR_HISTORY ? past.size() - WR_HISTORY : 0;
   time_t previous = 0;
   for (size_t i = start; i < past.size(); ++i) {
@@ -151,14 +158,33 @@ static bool wrFetchFrames(WrRemoteFrame *frames, uint8_t &count, char *error, si
     if (!path.startsWith("/v2/radar/") || path.indexOf("..") >= 0 || stamp < 1700000000 || stamp <= previous) {
       snprintf(error, errorSize, "Radar history invalid"); return false;
     }
+    previous = stamp;
+    if (stamp < cutoff) continue;
     frames[count].stamp = stamp; frames[count].path = path; ++count; previous = stamp;
   }
   return count > 0;
 }
 
 // All cache operations hold wrMutex. Only these entries own their crop buffers.
+// Two-byte runs preserve every color/alpha byte, including transparency.
+static bool wrUnpack(const uint8_t *data, size_t bytes, uint8_t *out) {
+  size_t written = 0;
+  if (bytes & 1) return false;
+  for (size_t i = 0; i < bytes; i += 2) {
+    size_t count = data[i];
+    if (!count || count > sizeof(wrDisplayPixels) - written) return false;
+    memset(out + written, data[i + 1], count); written += count;
+  }
+  return written == sizeof(wrDisplayPixels);
+}
 static void wrSelectFrame(uint8_t index) {
-  wrFrameIndex = index; wrOverlay = wrFrames[index].pixels; wrValid = true;
+  wrFrameIndex = index;
+  const auto &frame = wrFrames[index];
+  bool valid = true;
+  if (frame.packed) valid = wrUnpack(frame.pixels, frame.storedBytes, wrDisplayPixels);
+  else memcpy(wrDisplayPixels, frame.pixels, sizeof(wrDisplayPixels));
+  wrOverlay = valid ? wrDisplayPixels : nullptr; wrValid = valid;
+  if (!valid) { ++wrCodecFailures; snprintf(wrError, sizeof(wrError), "Cached radar decode failed"); }
   wrFrameTime = wrFrames[wrFrameCount - 1].stamp;
 }
 static void wrInsertFrame(time_t stamp, uint8_t *pixels) {
@@ -168,17 +194,56 @@ static void wrInsertFrame(time_t stamp, uint8_t *pixels) {
     for (uint8_t i = 1; i < wrFrameCount; ++i) wrFrames[i - 1] = wrFrames[i];
     --wrFrameCount;
   }
+  uint16_t storedBytes = sizeof(wrDisplayPixels); bool packed = false;
+  size_t encodedBytes = 0;
+  for (size_t i = 0; i < sizeof(wrDisplayPixels);) {
+    size_t count = 1;
+    while (count < 255 && i + count < sizeof(wrDisplayPixels) && pixels[i + count] == pixels[i]) ++count;
+    encodedBytes += 2; i += count;
+  }
+  // Fall back to the original crop when compression would be larger.
+  if (encodedBytes < sizeof(wrDisplayPixels)) {
+    uint8_t *encoded = static_cast<uint8_t *>(malloc(encodedBytes));
+    if (encoded) {
+      size_t at = 0;
+      for (size_t i = 0; i < sizeof(wrDisplayPixels);) {
+        size_t count = 1;
+        while (count < 255 && i + count < sizeof(wrDisplayPixels) && pixels[i + count] == pixels[i]) ++count;
+        encoded[at++] = uint8_t(count); encoded[at++] = pixels[i]; i += count;
+      }
+      // Validate every downloaded crop against its lossless round trip on-device.
+      if (wrUnpack(encoded, encodedBytes, wrDisplayPixels) &&
+          memcmp(pixels, wrDisplayPixels, sizeof(wrDisplayPixels)) == 0) {
+        ++wrLosslessChecks; free(pixels); pixels = encoded;
+        storedBytes = uint16_t(encodedBytes); packed = true;
+      } else { ++wrCodecFailures; free(encoded); }
+    }
+  }
   uint8_t at = wrFrameCount;
   while (at > 0 && wrFrames[at - 1].stamp > stamp) { wrFrames[at] = wrFrames[at - 1]; --at; }
-  wrFrames[at] = {stamp, pixels}; ++wrFrameCount;
+  wrFrames[at] = {stamp, pixels, storedBytes, packed}; ++wrFrameCount;
   uint8_t index = selected ? 0 : wrFrameCount - 1;
   for (uint8_t i = 0; i < wrFrameCount; ++i) if (wrFrames[i].stamp == selected) index = i;
   wrSelectFrame(index); wrChanged = true;
   if (wrFrameCount == 1) wrLastAnimationMs = millis();
 }
-static void wrClearFrames() {
-  for (uint8_t i = 0; i < wrFrameCount; ++i) { free(wrFrames[i].pixels); wrFrames[i] = {}; }
-  wrFrameCount = 0; wrFrameIndex = 0; wrOverlay = nullptr; wrValid = false; wrChanged = true;
+// Remove only timestamps outside the provider's current two-hour window.
+// Keep all reusable frames and preserve the displayed timestamp when possible.
+static void wrPruneHistory(time_t oldest) {
+  time_t selected = wrFrameCount ? wrFrames[wrFrameIndex].stamp : 0;
+  uint8_t kept = 0;
+  for (uint8_t i = 0; i < wrFrameCount; ++i) {
+    if (wrFrames[i].stamp < oldest) free(wrFrames[i].pixels);
+    else wrFrames[kept++] = wrFrames[i];
+  }
+  for (uint8_t i = kept; i < wrFrameCount; ++i) wrFrames[i] = {};
+  wrFrameCount = kept;
+  if (kept) {
+    uint8_t index = kept - 1;
+    for (uint8_t i = 0; i < kept; ++i) if (wrFrames[i].stamp == selected) index = i;
+    wrSelectFrame(index);
+  } else { wrFrameIndex = 0; wrOverlay = nullptr; wrValid = false; wrFrameTime = 0; }
+  wrChanged = true;
 }
 
 static bool wrDownload(const String &path, WrPagedBuffer &buffer, char *error, size_t errorSize) {
@@ -188,6 +253,10 @@ static bool wrDownload(const String &path, WrPagedBuffer &buffer, char *error, s
   if (!http.begin(tls, url)) { snprintf(error, errorSize, "Image connection failed"); return false; }
   int code = http.GET(); int contentLength = http.getSize();
   if (code != HTTP_CODE_OK || contentLength > int(WR_MAX_PNG)) {
+    if (code < 0) {
+      char detail[96]; int tlsError = tls.lastError(detail, sizeof(detail));
+      Serial.printf("weather-radar TLS: %d; heap: %u; largest: %u\n", tlsError, unsigned(ESP.getFreeHeap()), unsigned(ESP.getMaxAllocHeap()));
+    }
     snprintf(error, errorSize, "Radar image HTTP %d", code); http.end(); return false;
   }
   int received = http.writeToStream(&buffer); http.end();
@@ -210,6 +279,12 @@ static void wrWorker(void *) {
     else {
       bool metadataOK;
       { NetworkFetchGuard guard; metadataOK = wrFetchFrames(requested, requestedCount, error, sizeof(error)); }
+      if (metadataOK) {
+        xSemaphoreTake(wrMutex, portMAX_DELAY);
+        wrLastRequestedCount = requestedCount;
+        wrPruneHistory(requested[0].stamp);
+        xSemaphoreGive(wrMutex);
+      }
       // Load newest first for a useful image immediately, then fill history.
       if (metadataOK) for (int frame = int(requestedCount) - 1; frame >= 0; --frame) {
         xSemaphoreTake(wrMutex, portMAX_DELAY);
@@ -262,7 +337,9 @@ static void wrWorker(void *) {
           xSemaphoreTake(wrMutex, portMAX_DELAY); wrInsertFrame(requested[frame].stamp, pixels);
           xSemaphoreGive(wrMutex); pixels = nullptr; ok = true;
         }
-        free(pixels); vTaskDelay(pdMS_TO_TICKS(1));
+        free(pixels);
+        // Let foreground drawing and the other network tasks run between tiles.
+        vTaskDelay(pdMS_TO_TICKS(100));
       }
     }
     xSemaphoreTake(wrMutex, portMAX_DELAY);
@@ -280,7 +357,7 @@ static void wrWorker(void *) {
     else if (!error[0]) snprintf(error, sizeof(error), "Radar history incomplete");
     wrLastLoadedFrames = wrFrameCount;
     for (uint8_t i = 0; i < WR_HISTORY; ++i) wrLastHistory[i] = i < wrFrameCount ? wrFrames[i].stamp : 0;
-    snprintf(wrError, sizeof(wrError), "%s", error); wrBusy = false; wrChanged = true;
+    snprintf(wrError, sizeof(wrError), "%s", error); wrLastTry = millis(); wrBusy = false; wrChanged = true;
     uint8_t loaded = wrFrameCount; xSemaphoreGive(wrMutex);
     Serial.printf("weather-radar: %s; history: %u; heap: %u; largest: %u\n",
                   ok ? "OK" : error, loaded, unsigned(ESP.getFreeHeap()), unsigned(ESP.getMaxAllocHeap()));
@@ -306,9 +383,15 @@ static void initWeatherRadar() {
     JsonDocument doc;
     if (wrMutex) xSemaphoreTake(wrMutex, portMAX_DELAY);
     doc["center"] = "Thomson, GA"; doc["latitude"] = WR_LAT; doc["longitude"] = WR_LON;
+    doc["history_minutes"] = 120; doc["frame_capacity"] = WR_HISTORY;
+    doc["requested_frames"] = wrLastRequestedCount; doc["background_refresh"] = true;
     doc["radius_miles"] = 15; doc["valid"] = wrValid; doc["busy"] = wrBusy;
     doc["frame_time"] = wrFrameTime; doc["last_success_ms"] = wrLastSuccess; doc["error"] = wrError;
     doc["overlay_bytes"] = wrFrameCount * WR_CROP_SIZE * WR_CROP_SIZE;
+    size_t storedBytes = 0;
+    for (uint8_t i = 0; i < wrFrameCount; ++i) storedBytes += wrFrames[i].storedBytes;
+    doc["cache_storage_bytes"] = storedBytes;
+    doc["lossless_checks"] = wrLosslessChecks; doc["codec_failures"] = wrCodecFailures;
     doc["downloads"] = wrDownloadCount; doc["shared_workspace_bytes"] = radarWorkspace ? 221 * 221 : 0;
     doc["flight_buffer_ready"] = radarSpriteReady;
     doc["visible"] = currentPage == PAGE_WEATHER_RADAR && !wifiSetupOpen && !sleepOff;
@@ -329,7 +412,8 @@ static void initWeatherRadar() {
 static void weatherRadarService() {
   if (!wrMutex) return;
   bool visible = currentPage == PAGE_WEATHER_RADAR && !wifiSetupOpen && !sleepOff;
-  if (visible && (!wrLastTry || millis() - wrLastTry >= WR_INTERVAL)) weatherRadarRequest();
+  bool canRefresh = !wifiSetupOpen && wifiEnabled && WiFi.status() == WL_CONNECTED && time(nullptr) >= 1700000000;
+  if (canRefresh && (!wrLastTry || millis() - wrLastTry >= WR_INTERVAL)) weatherRadarRequest();
   if (xSemaphoreTake(wrMutex, 0) == pdTRUE) {
     if (visible && wrFrameCount > 1) {
       uint32_t hold = wrFrameIndex == wrFrameCount - 1 ? 1500 : 750;
@@ -337,7 +421,7 @@ static void weatherRadarService() {
         wrSelectFrame((wrFrameIndex + 1) % wrFrameCount); wrLastAnimationMs = millis();
         ++wrAnimationSteps; wrChanged = true;
       }
-    } // Keep decoded history when switching tabs; refresh only when visible.
+    } // Keep history and refresh it in the background; animate only when visible.
     xSemaphoreGive(wrMutex);
   }
   // Render changing frames independently of the dashboard's one-second clock.
@@ -412,7 +496,13 @@ static void updateWeatherRadarDynamic(bool force = false) {
 
 static void drawWeatherRadarPageFull() {
   tft.fillScreen(COL_BG); drawTopBar("Weather Radar"); drawNavBar();
-  weatherRadarRequest(); updateWeatherRadarDynamic(true);
+  // Opening the page uses the newest cached frame immediately. The background
+  // scheduler handles refresh timing, so tab changes never force redownloads.
+  if (wrMutex && xSemaphoreTake(wrMutex, 0) == pdTRUE) {
+    if (wrFrameCount) { wrSelectFrame(wrFrameCount - 1); wrLastAnimationMs = millis(); wrChanged = true; }
+    xSemaphoreGive(wrMutex);
+  }
+  updateWeatherRadarDynamic(true);
   lastDrawnPage = PAGE_WEATHER_RADAR; pageDirty = false;
 }
 

@@ -7,7 +7,7 @@ A touchscreen desk display with weather, stock charts, flight tracking, and anim
 - **Weather:** clock, date, configurable widgets, current temperature, wind, precipitation, and pressure. Pressure uses a three-hour trend; small changes show no arrow.
 - **Stocks:** Dow Jones and Nasdaq intraday charts, change from the market opening value, percentage change, and the current total index points below the change. The page shows Market Closed outside regular sessions.
 - **Flight Radar:** nearby aircraft over a dark road map, with a sweep, smaller aircraft icons, and an enlarged 220-pixel radar circle.
-- **Weather Radar:** up to seven past precipitation frames, with frame time and animation. Downloaded frames stay cached when changing pages.
+- **Weather Radar:** up to thirteen past precipitation frames spanning two hours, with frame time and animation. Downloaded frames stay cached and refresh in the background on other pages. Opening Weather Radar starts with the newest cached frame.
 
 Both radars are fixed to **Thomson, Georgia**, north up, with a **15-mile radius (30 miles across)**. Their shared map uses brighter gray roads, blue waterways, and white labels. Changing the normal weather location does **not** move the radar map.
 
